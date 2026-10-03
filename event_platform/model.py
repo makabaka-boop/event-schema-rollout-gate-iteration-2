@@ -22,6 +22,14 @@ class CompatibilityError(SchemaError):
     """新模式/回退目标与仍活跃消费者固定的字段不兼容。"""
 
 
+class CorrectionError(SchemaError):
+    """隔离事件更正重放本身非法（如隔离记录不存在）。
+
+    校验失败、修订冲突、映射无法满足属于业务裁决，以拒绝结果返回，
+    不抛此异常。
+    """
+
+
 class FieldType(enum.Enum):
     INT = "int"
     FLOAT = "float"

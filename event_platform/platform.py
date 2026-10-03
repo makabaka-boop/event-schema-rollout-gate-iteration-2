@@ -1,14 +1,15 @@
 """平台门面：把注册、接入、投影三个模块接到同一把锁上。
 
-跨模块操作（发布时检查消费者、入库时生成投影）都在共享的 RLock
-临界区内完成，保证对外呈现的状态永远一致。
+跨模块操作（发布时检查消费者、入库时生成投影、隔离更正重放时的
+版本校验与全量投影发布）都在共享的 RLock 临界区内完成，保证对外
+呈现的状态永远一致。
 """
 from __future__ import annotations
 
 import threading
 
 from .consumers import ConsumerManager
-from .ingestion import IngestResult, IngestionEngine
+from .ingestion import CorrectionResult, IngestResult, IngestionEngine
 from .registry import Proposal, SchemaRegistry
 
 
@@ -36,3 +37,18 @@ class EventPlatform:
 
     def ingest(self, event_id: str, producer_id: str, schema_version: int, payload) -> IngestResult:
         return self.ingestion.ingest(event_id, producer_id, schema_version, payload)
+
+    # ---------- 隔离事件更正重放 ----------
+
+    def replay_correction(self, quarantine_id: str, expected_revision: int,
+                          schema_version: int, corrected_payload) -> CorrectionResult:
+        """运营修正隔离事件。
+
+        与发布/回退/弃用/消费者升级共用同一把锁：按声明版本的校验与
+        基于活跃消费者集合的投影裁决来自同一时刻，原子地一次发布，
+        失败不留任何部分正式数据。
+        """
+        with self._lock:
+            return self.ingestion.replay_correction(
+                quarantine_id, expected_revision, schema_version, corrected_payload
+            )
