@@ -1,10 +1,15 @@
 """事件模式平台：模式注册 + 事件接入 + 消费者投影。"""
 from .consumers import Consumer, ConsumerManager, ProjectedEvent
 from .ingestion import (
+    CorrectionResolution,
+    CorrectionResult,
+    CorrectionStatus,
     IngestionEngine,
     IngestResult,
     IngestStatus,
     QuarantineRecord,
+    QuarantineStatus,
+    RevisionConflictError,
     StoredEvent,
 )
 from .model import (
@@ -22,6 +27,9 @@ __all__ = [
     "CompatibilityError",
     "Consumer",
     "ConsumerManager",
+    "CorrectionResolution",
+    "CorrectionResult",
+    "CorrectionStatus",
     "EventPlatform",
     "Field",
     "FieldType",
@@ -31,6 +39,8 @@ __all__ = [
     "ProjectedEvent",
     "Proposal",
     "QuarantineRecord",
+    "QuarantineStatus",
+    "RevisionConflictError",
     "SchemaError",
     "SchemaRegistry",
     "SchemaVersion",

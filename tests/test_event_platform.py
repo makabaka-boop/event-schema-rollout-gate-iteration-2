@@ -10,10 +10,13 @@ from unittest import mock
 
 from event_platform import (
     CompatibilityError,
+    CorrectionStatus,
     EventPlatform,
     Field,
     FieldType,
     IngestStatus,
+    QuarantineStatus,
+    RevisionConflictError,
     SchemaError,
     ValidationError,
 )
@@ -305,6 +308,163 @@ class IngestionTest(unittest.TestCase):
         stored = p.ingestion.stored_events[0]
         self.assertEqual(stored.payload, {1: 1, 2: "n/a"})  # 默认值已套用
         self.assertEqual(stored.schema_version, 1)
+
+
+class CorrectionTest(unittest.TestCase):
+    """隔离事件的更正重放：交错验证版本切换、默认值、重复请求与部分投影失败。"""
+
+    def test_correction_republishes_event_atomically_and_keeps_audit(self):
+        p = build_platform()
+        p.consumers.register("analytics", {1: INT, 2: STRING})
+        p.consumers.register("audit", {1: INT, 3: BOOL})
+        r = p.ingest("bad-1", "producer-a", 1, {1: "oops", 3: True})
+        self.assertEqual(r.status, IngestStatus.QUARANTINED)
+
+        res = p.correct("fix-1", "bad-1", 0, 1, {1: 42, 3: True})
+        self.assertTrue(res.resolved)
+        self.assertEqual((res.correction_id, res.event_id), ("fix-1", "bad-1"))
+
+        # 正式事件与全部消费者投影同时可见 —— 不存在"有人看到投影、有人仍看到失败"
+        self.assertEqual([e.event_id for e in p.ingestion.stored_events], ["bad-1"])
+        self.assertEqual(projected(p, "analytics"), [("bad-1", 1, {1: 42, 2: "n/a"})])
+        self.assertEqual(projected(p, "audit"), [("bad-1", 1, {1: 42, 3: True})])
+
+        # 隔离记录标记已处理、修订递增，原失败内容保留供审计
+        (q,) = p.ingestion.quarantined_events
+        self.assertEqual(q.status, QuarantineStatus.RESOLVED)
+        self.assertEqual(q.revision, 1)
+        self.assertEqual(q.payload, {1: "oops", 3: True})  # 原内容未动
+        self.assertIn("期望", q.reason)
+        self.assertEqual(q.resolution.correction_id, "fix-1")
+        self.assertEqual(q.resolution.schema_version, 1)
+        self.assertEqual(q.resolution.payload, {1: 42, 2: "n/a", 3: True})
+
+    def test_interleaved_correction_with_version_switching_and_defaults(self):
+        p = build_platform()
+        p.consumers.register("analytics", {1: INT, 2: STRING})
+        p.consumers.register("audit", {1: INT, 3: BOOL})
+
+        # v1 时期两条隔离：类型错误 / 可选字段类型错误
+        self.assertFalse(p.ingest("q1", "prod", 1, {1: "bad"}).accepted)
+        self.assertFalse(p.ingest("q2", "prod", 1, {1: 1, 2: 3}).accepted)
+
+        # 发布 v2：新增可选字段 4（带默认值）
+        p.publish(p.begin_proposal().add_field(Field(4, "score", FLOAT, default=0.0)))
+
+        # 过渡期内按 v1 更正 q1：成功，套用 v1 的默认值
+        r1 = p.correct("fix-q1", "q1", 0, 1, {1: 10})
+        self.assertTrue(r1.resolved)
+        self.assertEqual(p.ingestion.stored_events[-1].schema_version, 1)
+        self.assertEqual(p.ingestion.stored_events[-1].payload, {1: 10, 2: "n/a"})
+        # 相同更正请求重试 -> 返回原结果，不重复入库
+        self.assertIs(p.correct("fix-q1", "q1", 0, 1, {1: 10}), r1)
+        self.assertEqual(len(p.ingestion.stored_events), 1)
+
+        # 弃用 v1 后：q2 按 v1 更正被拒（记录保持待处理，可换版本再更正）
+        p.registry.deprecate(1)
+        r2 = p.correct("fix-q2-v1", "q2", 0, 1, {1: 2, 2: "ok"})
+        self.assertEqual(r2.status, CorrectionStatus.REJECTED)
+        self.assertIn("弃用", r2.reason)
+        self.assertEqual(len(p.ingestion.stored_events), 1)
+        # 按 v2 更正 q2：字段 4 的默认值被套用，事件以 v2 入库
+        r3 = p.correct("fix-q2-v2", "q2", 0, 2, {1: 2, 2: "ok"})
+        self.assertTrue(r3.resolved)
+        self.assertEqual(p.ingestion.stored_events[-1].schema_version, 2)
+        self.assertEqual(p.ingestion.stored_events[-1].payload, {1: 2, 2: "ok", 4: 0.0})
+
+        # 各消费者投影一致地看到两条重放事件
+        self.assertEqual(
+            projected(p, "analytics"),
+            [("q1", 1, {1: 10, 2: "n/a"}), ("q2", 2, {1: 2, 2: "ok"})],
+        )
+        self.assertEqual(
+            projected(p, "audit"),
+            [("q1", 1, {1: 10, 3: None}), ("q2", 2, {1: 2, 3: None})],
+        )
+        # 两条隔离记录都已处理，原失败内容仍保留
+        self.assertEqual(
+            [q.status for q in p.ingestion.quarantined_events],
+            [QuarantineStatus.RESOLVED, QuarantineStatus.RESOLVED],
+        )
+        self.assertEqual(p.ingestion.quarantined_events[1].payload, {1: 1, 2: 3})
+
+    def test_duplicate_correction_requests(self):
+        p = build_platform()
+        p.consumers.register("c", {1: INT})
+        self.assertFalse(p.ingest("q1", "p", 1, {1: "bad"}).accepted)
+
+        res = p.correct("fix-1", "q1", 0, 1, {1: 5})
+        self.assertTrue(res.resolved)
+        # 相同请求重试 -> 原结果（同一对象），不重复入库
+        self.assertIs(p.correct("fix-1", "q1", 0, 1, {1: 5}), res)
+        self.assertEqual(len(p.ingestion.stored_events), 1)
+        # 同一标识携带不同内容 -> 拒绝，不得借用旧成功回执
+        with self.assertRaises(ValueError):
+            p.correct("fix-1", "q1", 0, 1, {1: 6})
+        with self.assertRaises(ValueError):
+            p.correct("fix-1", "q1", 0, 2, {1: 5})
+        # 换标识但修订已前进 -> 修订冲突
+        with self.assertRaises(RevisionConflictError):
+            p.correct("fix-2", "q1", 0, 1, {1: 6})
+        # 按当前修订提交 -> 记录已处理，不能重复更正
+        with self.assertRaises(SchemaError):
+            p.correct("fix-3", "q1", 1, 1, {1: 6})
+        # 不存在的隔离记录
+        with self.assertRaises(SchemaError):
+            p.correct("fix-4", "no-such-event", 0, 1, {1: 6})
+        # 上述失败都不留正式数据
+        self.assertEqual(len(p.ingestion.stored_events), 1)
+
+    def test_rejected_correction_is_also_idempotent(self):
+        p = build_platform()
+        p.consumers.register("c", {1: INT})
+        self.assertFalse(p.ingest("q1", "p", 1, {1: "bad"}).accepted)
+        # 更正后的值仍不合法 -> 拒绝；相同请求重试返回原失败结果
+        res = p.correct("fix-1", "q1", 0, 1, {1: "still-bad"})
+        self.assertEqual(res.status, CorrectionStatus.REJECTED)
+        self.assertIs(p.correct("fix-1", "q1", 0, 1, {1: "still-bad"}), res)
+        # 记录保持待处理、修订不变，可换标识用合法值再更正
+        (q,) = p.ingestion.quarantined_events
+        self.assertEqual((q.status, q.revision), (QuarantineStatus.PENDING, 0))
+        self.assertTrue(p.correct("fix-2", "q1", 0, 1, {1: 7}).resolved)
+
+    def test_correction_projection_failure_leaves_no_partial_state(self):
+        """更正时投影构建中途失败：不入库、任何消费者不留部分投影、记录保持待处理。"""
+        p = build_platform()
+        p.consumers.register("c1", {1: INT})
+        p.consumers.register("c2", {1: INT})
+        self.assertFalse(p.ingest("q1", "p", 1, {1: "bad"}).accepted)
+
+        def boom(requirements, normalized):
+            raise RuntimeError("模拟投影构建失败")
+
+        with mock.patch("event_platform.ingestion.build_projection", boom):
+            res = p.correct("fix-1", "q1", 0, 1, {1: 5})
+        self.assertEqual(res.status, CorrectionStatus.REJECTED)
+        self.assertIn("投影构建失败", res.reason)
+        self.assertEqual(p.ingestion.stored_events, ())
+        self.assertEqual(p.consumers.projections_of("c1"), [])
+        self.assertEqual(p.consumers.projections_of("c2"), [])
+        (q,) = p.ingestion.quarantined_events
+        self.assertEqual((q.status, q.revision), (QuarantineStatus.PENDING, 0))
+        self.assertIsNone(q.resolution)
+        # 故障消除后换新标识重试成功，两个消费者同时看到投影
+        self.assertTrue(p.correct("fix-2", "q1", 0, 1, {1: 5}).resolved)
+        self.assertEqual(len(p.consumers.projections_of("c1")), 1)
+        self.assertEqual(
+            p.consumers.projections_of("c1"), p.consumers.projections_of("c2")
+        )
+
+    def test_correction_uses_active_consumers_at_commit_moment(self):
+        p = build_platform()
+        p.consumers.register("gone", {1: INT})
+        p.consumers.register("stay", {1: INT})
+        self.assertFalse(p.ingest("q1", "p", 1, {1: "bad"}).accepted)
+        # 注销发生在更正之前：gone 不属于"同一时刻仍活跃"的集合，不收投影
+        p.consumers.deregister("gone")
+        self.assertTrue(p.correct("fix-1", "q1", 0, 1, {1: 5}).resolved)
+        self.assertEqual(p.consumers.projections_of("gone"), [])
+        self.assertEqual(projected(p, "stay"), [("q1", 1, {1: 5})])
 
 
 class ConcurrencyTest(unittest.TestCase):

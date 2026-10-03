@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 
 from .consumers import ConsumerManager
-from .ingestion import IngestResult, IngestionEngine
+from .ingestion import CorrectionResult, IngestResult, IngestionEngine
 from .registry import Proposal, SchemaRegistry
 
 
@@ -36,3 +36,10 @@ class EventPlatform:
 
     def ingest(self, event_id: str, producer_id: str, schema_version: int, payload) -> IngestResult:
         return self.ingestion.ingest(event_id, producer_id, schema_version, payload)
+
+    def correct(self, correction_id: str, event_id: str, expected_revision: int,
+                schema_version: int, payload) -> CorrectionResult:
+        """更正重放一条隔离记录（详见 IngestionEngine.correct）。"""
+        return self.ingestion.correct(
+            correction_id, event_id, expected_revision, schema_version, payload
+        )
